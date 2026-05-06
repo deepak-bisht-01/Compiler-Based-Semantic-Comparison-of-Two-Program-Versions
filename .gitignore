@@ -1,0 +1,7 @@
+build/
+node_modules/
+.vscode/
+.vs/
+*.exe
+*.obj
+*.pdb
