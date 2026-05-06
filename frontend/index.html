@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Semantic C++ Compare</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.49.0/min/vs/loader.js"></script>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Semantic C++ Comparator</h1>
+        <p>AST-based structural comparison powered by LLVM/Clang.</p>
+      </header>
+
+      <section class="editor-grid">
+        <div class="panel">
+          <h2>Left C++ Code</h2>
+          <div id="editor-left" class="editor"></div>
+        </div>
+        <div class="panel">
+          <h2>Right C++ Code</h2>
+          <div id="editor-right" class="editor"></div>
+        </div>
+      </section>
+
+      <section class="controls">
+        <button id="compare-btn">Compare</button>
+        <span id="loading" class="loading hidden">Comparing...</span>
+      </section>
+
+      <section class="output">
+        <h2>Output</h2>
+        <pre id="result-panel">Run a comparison to see results.</pre>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
