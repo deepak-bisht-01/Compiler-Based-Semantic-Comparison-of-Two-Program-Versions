@@ -7,16 +7,14 @@
     return [];
   }
 
+  function formatReturnTypeFromQualType(qualType) {
+    if (typeof qualType !== "string") return null;
+    const m = qualType.trim().match(/^(.+?)\s*\(/);
+    return m ? m[1].trim() : qualType.trim();
+  }
+
   function nodeLabel(d) {
-    const n = d.data || {};
-    const kind = n.kind || "Unknown";
-    const name = n.name || n.qualifiedName || n.mangledName || n.value || "";
-    const loc = n.loc || n.range?.begin || null;
-    const locText =
-      loc && typeof loc === "object" && typeof loc.line === "number"
-        ? `@${loc.line}:${loc.col ?? ""}`
-        : "";
-    return `${kind}${name ? `: ${name}` : ""}${locText ? ` ${locText}` : ""}`;
+    return nodeLabelFromData(d?.data || {});
   }
 
   function diffClass(d) {
@@ -25,6 +23,86 @@
     if (t === "removed") return "ast-node-removed";
     if (t === "modified") return "ast-node-modified";
     return "ast-node-same";
+  }
+
+  function nodeLabelFromData(n) {
+    const kind = n?.kind || "Unknown";
+    const name = n?.name || n?.qualifiedName || n?.mangledName || n?.value || "";
+
+    // Hide internal fallback wrapper kind to keep UI clean.
+    if (kind === "PseudoNode") {
+      return name || "Node";
+    }
+
+    let label = kind;
+    if (name) label += ` ${name}`;
+
+    // Match clang textual style: for FunctionDecl (like main), show return type.
+    if (kind.includes("FunctionDecl")) {
+      const qualType = n?.type?.qualType || n?.type?.desugaredQualType || null;
+      const ret = formatReturnTypeFromQualType(qualType);
+      if (ret) label += ` : ${ret}`;
+    }
+
+    return label;
+  }
+
+  function renderTreeFallback(containerEl, rootData, titleText) {
+    containerEl.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "ast-title";
+    title.textContent = `${titleText} (fallback tree)`;
+    containerEl.appendChild(title);
+
+    const viewport = document.createElement("div");
+    viewport.className = "ast-viewport";
+    viewport.style.overflow = "auto";
+    viewport.style.padding = "10px 12px";
+    containerEl.appendChild(viewport);
+
+    const pre = document.createElement("pre");
+    pre.style.whiteSpace = "pre";
+    pre.style.margin = "0";
+    pre.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    pre.style.fontSize = "12px";
+    viewport.appendChild(pre);
+
+    const maxDepth = 22;
+    const maxNodes = 1200;
+    let nodeCount = 0;
+
+    const lines = [];
+    const rootNode = rootData || { kind: "Program", inner: [] };
+    lines.push(nodeLabelFromData(rootNode));
+
+    function walk(node, prefix, depth) {
+      if (!node || typeof node !== "object") return;
+      if (depth >= maxDepth) return;
+      if (nodeCount >= maxNodes) return;
+
+      const kids = astChildren(node);
+      if (!kids.length) return;
+
+      const truncatedKids = kids.length > 500 ? kids.slice(0, 500) : kids;
+      for (let i = 0; i < truncatedKids.length; i += 1) {
+        if (nodeCount >= maxNodes) break;
+        nodeCount += 1;
+        const k = truncatedKids[i];
+        const lastChild = i === truncatedKids.length - 1;
+        const branch = lastChild ? "└── " : "├── ";
+        lines.push(`${prefix}${branch}${nodeLabelFromData(k)}`);
+        const childPrefix = prefix + (lastChild ? "    " : "│   ");
+        walk(k, childPrefix, depth + 1);
+      }
+
+      if (kids.length > truncatedKids.length && nodeCount < maxNodes) {
+        lines.push(`${prefix}└── ... ${kids.length - truncatedKids.length} more nodes`);
+      }
+    }
+
+    walk(rootNode, "", 0);
+    if (nodeCount >= maxNodes) lines.push("... output truncated");
+    pre.textContent = lines.join("\n");
   }
 
   function renderTree(containerEl, rootData, titleText) {
@@ -148,6 +226,12 @@
     const leftEl = document.getElementById("ast-left");
     const rightEl = document.getElementById("ast-right");
     if (!leftEl || !rightEl) throw new Error("AST containers not found in DOM.");
+
+    if (typeof window.d3 === "undefined") {
+      renderTreeFallback(leftEl, leftAst, "Left AST");
+      renderTreeFallback(rightEl, rightAst, "Right AST");
+      return;
+    }
 
     renderTree(leftEl, leftAst, "Left AST");
     renderTree(rightEl, rightAst, "Right AST");

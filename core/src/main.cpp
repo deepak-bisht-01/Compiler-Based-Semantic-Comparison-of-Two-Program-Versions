@@ -37,7 +37,7 @@ std::optional<std::string> run_clang_ast_dump_json(const std::string& source_pat
     args.emplace_back(source_path);
 
     // Capture stdout into a file (clang's AST dump is large).
-    llvm::Optional<llvm::StringRef> redirects[3];
+    std::optional<llvm::StringRef> redirects[3];
     redirects[0] = llvm::StringRef(); // stdin
     redirects[1] = llvm::StringRef(out_path); // stdout -> file
     redirects[2] = llvm::StringRef(); // stderr

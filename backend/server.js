@@ -8,6 +8,10 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Normalize temp env vars (some systems have trailing spaces).
+if (process.env.TEMP) process.env.TEMP = String(process.env.TEMP).trim();
+if (process.env.TMP) process.env.TMP = String(process.env.TMP).trim();
+
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "../frontend")));
 
@@ -33,9 +37,54 @@ function resolveClangXXExecutable() {
   }
 }
 
+let cachedVsDevEnv = null;
+
+function getVsDevEnv() {
+  if (cachedVsDevEnv) return cachedVsDevEnv;
+  const vsDevCmdRaw = process.env.VSDEVCMD;
+  if (!vsDevCmdRaw) return null;
+
+  const vsDevCmd = String(vsDevCmdRaw).trim().replace(/^"+|"+$/g, "").replace(/\\"/g, "\"");
+  // Capture environment after VsDevCmd initializes MSVC/SDK paths.
+  const capture = spawnSync(
+    "cmd.exe",
+    [
+      "/c",
+      `call ""${vsDevCmd}"" -no_logo -arch=x64 -host_arch=x64 >nul && set`
+    ],
+    { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 60000 }
+  );
+
+  if (capture.error) throw capture.error;
+  if (capture.status !== 0) {
+    throw new Error(
+      (capture.stderr || "").trim() ||
+        `Failed to initialize VS dev environment (exit ${capture.status}).`
+    );
+  }
+
+  const env = {};
+  for (const line of (capture.stdout || "").split(/\r?\n/)) {
+    const idx = line.indexOf("=");
+    if (idx <= 0) continue;
+    const k = line.slice(0, idx);
+    const v = line.slice(idx + 1);
+    env[k] = v;
+  }
+
+  if (env.TEMP) env.TEMP = String(env.TEMP).trim();
+  if (env.TMP) env.TMP = String(env.TMP).trim();
+
+  cachedVsDevEnv = env;
+  return cachedVsDevEnv;
+}
+
 async function writeTempCodeFile(code, suffix) {
   const fileName = `compare-${Date.now()}-${Math.random().toString(36).slice(2)}-${suffix}.cpp`;
-  const filePath = path.join(os.tmpdir(), fileName);
+  // On some Windows setups, %TEMP% can contain a trailing space, which breaks
+  // file creation and downstream compiler invocations. Normalize it.
+  const tmpDir = String(os.tmpdir() || "").trim();
+  const filePath = path.join(tmpDir, fileName);
   await fs.writeFile(filePath, code, "utf8");
   return filePath;
 }
@@ -132,19 +181,52 @@ function extractTopLevelBlock(code) {
     .trim();
 }
 
-function runClangAstDumpJson(clangxx, cppPath) {
+function runClangAstDumpJsonFromCode(clangxx, code, filenameHint = "input.cpp") {
+  const vsEnv = process.platform === "win32" ? getVsDevEnv() : null;
+
+  // Prefer clang-cl on Windows when VS env is available (handles MSVC headers/libs).
+  const clangCl =
+    process.env.CLANGCL ||
+    (typeof clangxx === "string" && clangxx.toLowerCase().endsWith("clang++.exe")
+      ? clangxx.slice(0, -("clang++.exe".length)) + "clang-cl.exe"
+      : null);
+
+  const useClangCl = Boolean(vsEnv && clangCl);
+
   const result = spawnSync(
-    clangxx,
-    ["-std=c++17", "-Xclang", "-ast-dump=json", "-fsyntax-only", "-fno-color-diagnostics", cppPath],
+    useClangCl ? clangCl : clangxx,
+    useClangCl
+      ? [
+          "-std=c++17",
+          "-Xclang",
+          "-ast-dump=json",
+          "-fsyntax-only",
+          "-fno-color-diagnostics",
+          "-xc++",
+          "-"
+        ]
+      : ["-std=c++17", "-Xclang", "-ast-dump=json", "-fsyntax-only", "-fno-color-diagnostics", "-xc++", "-"],
     {
       encoding: "utf8",
-      maxBuffer: 50 * 1024 * 1024
+      maxBuffer: 50 * 1024 * 1024,
+      timeout: 20000,
+      env: (() => {
+        const base = vsEnv ? { ...process.env, ...vsEnv } : { ...process.env };
+        if (base.TEMP) base.TEMP = String(base.TEMP).trim();
+        if (base.TMP) base.TMP = String(base.TMP).trim();
+        return base;
+      })(),
+      input: code
     }
   );
 
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    const msg = (result.stderr || "").trim() || `clang++ exited with code ${result.status}`;
+    const msg =
+      (result.stderr || "").trim() ||
+      `clang AST dump exited with code ${result.status}${
+        useClangCl ? " (clang-cl + VS env)" : ""
+      }`;
     throw new Error(msg);
   }
 
@@ -382,6 +464,60 @@ function buildPseudoParseTree(code) {
   }
 
   return tree.join("\n");
+}
+
+function buildPseudoAstFromCode(code) {
+  const diagram = buildPseudoParseTree(code).split(/\r?\n/).filter(Boolean);
+  const root = { kind: "Program", name: "Program", inner: [] };
+  const stack = [root];
+
+  for (const line of diagram.slice(1)) {
+    const m = line.match(/^((?:\|\s\s)*)\|-\s(.*)$/);
+    if (!m) continue;
+    const depth = (m[1] ? m[1].length / 3 : 0) + 1;
+    const label = m[2].trim();
+    const node = { kind: "PseudoNode", name: label, inner: [] };
+    while (stack.length > depth) stack.pop();
+    stack[stack.length - 1].inner.push(node);
+    stack.push(node);
+  }
+  return root;
+}
+
+function mergeLlvmAndPhaseResult(llvmResult, phaseResult) {
+  const out = { ...phaseResult };
+
+  const added = Array.isArray(llvmResult?.addedFunctions) ? llvmResult.addedFunctions : out.functions?.added || [];
+  const removed = Array.isArray(llvmResult?.removedFunctions) ? llvmResult.removedFunctions : out.functions?.removed || [];
+  const changedNames = Array.isArray(llvmResult?.changedFunctions) ? llvmResult.changedFunctions : [];
+  const prevChanged = Array.isArray(out.functions?.changed) ? out.functions.changed : [];
+  const prevMap = new Map(prevChanged.map((c) => [c.name, c]));
+
+  out.functions = {
+    ...out.functions,
+    added,
+    removed,
+    changed: changedNames.map((name) => prevMap.get(name) || { name, reason: "LLVM AST-reported change" })
+  };
+
+  out.classes = {
+    ...out.classes,
+    added: Array.isArray(llvmResult?.addedClasses) ? llvmResult.addedClasses : out.classes?.added || [],
+    removed: Array.isArray(llvmResult?.removedClasses) ? llvmResult.removedClasses : out.classes?.removed || []
+  };
+
+  const llvmSummary = [
+    `LLVM semantic summary: +${out.functions.added.length} function(s), -${out.functions.removed.length} function(s), ~${out.functions.changed.length} function(s).`,
+    `LLVM semantic summary: +${out.classes.added.length} class/struct(s), -${out.classes.removed.length} class/struct(s).`
+  ];
+  out.summary = [...llvmSummary, ...(Array.isArray(out.summary) ? out.summary : [])];
+
+  out.notes = [
+    ...(Array.isArray(llvmResult?.notes) ? llvmResult.notes : []),
+    ...(Array.isArray(out.notes) ? out.notes : [])
+  ];
+
+  return out;
 }
 
 function buildSyntaxTreeWithPython(code) {
@@ -744,11 +880,9 @@ app.get("/compare", async (req, res) => {
 
     try {
       const rawOutput = await runCompare(compareExe, localLeft, localRight);
-      try {
-        result = JSON.parse(rawOutput);
-      } catch {
-        result = rawOutput;
-      }
+      const llvmParsed = JSON.parse(rawOutput);
+      const phaseResult = await runFallbackCompare(localLeft, localRight);
+      result = mergeLlvmAndPhaseResult(llvmParsed, phaseResult);
     } catch (llvmError) {
       if (llvmError.message.includes("ENOENT")) {
         mode = "fallback";
@@ -821,13 +955,25 @@ app.post("/ast", async (req, res) => {
     const clangxx = resolveClangXXExecutable();
     let leftAST;
     let rightAST;
+    let astMode = "clang";
+    let astWarning = null;
     try {
-      leftAST = runClangAstDumpJson(clangxx, localLeft);
-      rightAST = runClangAstDumpJson(clangxx, localRight);
+      const leftSource =
+        typeof leftCode === "string" ? leftCode : await fs.readFile(localLeft, "utf8");
+      const rightSource =
+        typeof rightCode === "string" ? rightCode : await fs.readFile(localRight, "utf8");
+
+      leftAST = runClangAstDumpJsonFromCode(clangxx, leftSource, localLeft || "left.cpp");
+      rightAST = runClangAstDumpJsonFromCode(clangxx, rightSource, localRight || "right.cpp");
     } catch (e) {
-      throw new Error(
-        `clang++ AST dump failed. Ensure LLVM is installed and set CLANGXX or add LLVM bin to PATH. Details: ${e.message}`
-      );
+      const leftSource =
+        typeof leftCode === "string" ? leftCode : await fs.readFile(localLeft, "utf8");
+      const rightSource =
+        typeof rightCode === "string" ? rightCode : await fs.readFile(localRight, "utf8");
+      leftAST = buildPseudoAstFromCode(leftSource);
+      rightAST = buildPseudoAstFromCode(rightSource);
+      astMode = "fallback";
+      astWarning = `clang++ AST dump failed, using pseudo AST fallback. Details: ${e.message}`;
     }
 
     const astDiff = diffAsts(leftAST, rightAST);
@@ -837,7 +983,9 @@ app.post("/ast", async (req, res) => {
       leftAST,
       rightAST,
       comparison,
-      astDiff
+      astDiff,
+      astMode,
+      astWarning
     });
   } catch (err) {
     return res.status(500).json({

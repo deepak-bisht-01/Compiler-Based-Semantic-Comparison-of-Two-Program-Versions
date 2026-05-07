@@ -25,6 +25,22 @@ function formatLexicalTable(rows) {
   return out.join("\n");
 }
 
+function formatSideBySideTable(title, rows) {
+  const header = ["Metric", "Left", "Right"];
+  const metricW = Math.max(header[0].length, ...rows.map((r) => String(r.metric ?? "").length));
+  const leftW = Math.max(header[1].length, ...rows.map((r) => String(r.left ?? "").length));
+  const rightW = Math.max(header[2].length, ...rows.map((r) => String(r.right ?? "").length));
+
+  const line = `+-${"-".repeat(metricW)}-+-${"-".repeat(leftW)}-+-${"-".repeat(rightW)}-+`;
+  const format = (a, b, c) =>
+    `| ${String(a).padEnd(metricW)} | ${String(b).padEnd(leftW)} | ${String(c).padEnd(rightW)} |`;
+
+  const out = [title, line, format(header[0], header[1], header[2]), line];
+  for (const r of rows) out.push(format(r.metric, r.left, r.right));
+  out.push(line);
+  return out.join("\n");
+}
+
 function renderReadable(result) {
   if (!result || typeof result !== "object") return prettyPrintResult(result);
 
@@ -123,8 +139,17 @@ function renderReadable(result) {
     lines.push("1) Lexical");
     const leftLex = result.phases.left.lexical;
     const rightLex = result.phases.right.lexical;
-    lines.push(`Left token count : ${leftLex.tokenCount}`);
-    lines.push(`Right token count: ${rightLex.tokenCount}`);
+    lines.push(
+      formatSideBySideTable("Lexical Summary", [
+        { metric: "Token Count", left: leftLex.tokenCount, right: rightLex.tokenCount },
+        { metric: "Keywords", left: (leftLex.groups?.keywords || []).length, right: (rightLex.groups?.keywords || []).length },
+        { metric: "Identifiers", left: (leftLex.groups?.identifiers || []).length, right: (rightLex.groups?.identifiers || []).length },
+        { metric: "Literals", left: (leftLex.groups?.literals || []).length, right: (rightLex.groups?.literals || []).length },
+        { metric: "Operators", left: (leftLex.groups?.operators || []).length, right: (rightLex.groups?.operators || []).length },
+        { metric: "Punctuation", left: (leftLex.groups?.punctuation || []).length, right: (rightLex.groups?.punctuation || []).length }
+      ])
+    );
+    lines.push("");
     lines.push("Grouped lexemes (Left):");
     lines.push(`- keywords: ${(leftLex.groups?.keywords || []).join(", ") || "none"}`);
     lines.push(`- identifiers: ${(leftLex.groups?.identifiers || []).join(", ") || "none"}`);
@@ -146,6 +171,15 @@ function renderReadable(result) {
     lines.push("");
 
     lines.push("2) Syntax Tree");
+    const leftSyntaxLines = String(result.phases.left.syntax.parseTreeDiagram || "Program").split("\n");
+    const rightSyntaxLines = String(result.phases.right.syntax.parseTreeDiagram || "Program").split("\n");
+    lines.push(
+      formatSideBySideTable("Syntax Summary", [
+        { metric: "Tree Lines", left: leftSyntaxLines.length, right: rightSyntaxLines.length },
+        { metric: "Root", left: leftSyntaxLines[0] || "Program", right: rightSyntaxLines[0] || "Program" }
+      ])
+    );
+    lines.push("");
     lines.push("Left parse tree:");
     lines.push(result.phases.left.syntax.parseTreeDiagram || "Program");
     lines.push("");
@@ -154,6 +188,26 @@ function renderReadable(result) {
     lines.push("");
 
     lines.push("3) Semantic");
+    lines.push(
+      formatSideBySideTable("Semantic Summary", [
+        {
+          metric: "Checks",
+          left: (result.phases.left.semantic.checks || []).length,
+          right: (result.phases.right.semantic.checks || []).length
+        },
+        {
+          metric: "Pass",
+          left: (result.phases.left.semantic.checks || []).filter((c) => c.status === "PASS").length,
+          right: (result.phases.right.semantic.checks || []).filter((c) => c.status === "PASS").length
+        },
+        {
+          metric: "Warn/Fail",
+          left: (result.phases.left.semantic.checks || []).filter((c) => c.status !== "PASS").length,
+          right: (result.phases.right.semantic.checks || []).filter((c) => c.status !== "PASS").length
+        }
+      ])
+    );
+    lines.push("");
     lines.push("Left semantic checks:");
     for (const c of result.phases.left.semantic.checks || []) {
       lines.push(`- [${c.status}] ${c.check}: ${c.detail}`);
@@ -165,15 +219,31 @@ function renderReadable(result) {
     lines.push("");
 
     lines.push("4) Complexity");
-    lines.push(`Left : ${result.phases.left.complexity.bigO} (${result.phases.left.complexity.reason})`);
-    lines.push(`Right: ${result.phases.right.complexity.bigO} (${result.phases.right.complexity.reason})`);
+    lines.push(
+      formatSideBySideTable("Complexity Summary", [
+        {
+          metric: "Big-O",
+          left: result.phases.left.complexity.bigO || "-",
+          right: result.phases.right.complexity.bigO || "-"
+        },
+        {
+          metric: "Reason",
+          left: result.phases.left.complexity.reason || "-",
+          right: result.phases.right.complexity.reason || "-"
+        }
+      ])
+    );
     lines.push("");
   }
 
   if (result.verdict) {
     lines.push("5) Better Program");
-    lines.push(`Better program: ${result.verdict.betterProgram}`);
-    lines.push(`Reason: ${result.verdict.reason}`);
+    lines.push(
+      formatSideBySideTable("Verdict", [
+        { metric: "Better Program", left: result.verdict.betterProgram || "-", right: "-" },
+        { metric: "Reason", left: result.verdict.reason || "-", right: "-" }
+      ])
+    );
     if (Array.isArray(result.verdict.differences) && result.verdict.differences.length) {
       lines.push("Key differences:");
       for (const d of result.verdict.differences) lines.push(`- ${d}`);
