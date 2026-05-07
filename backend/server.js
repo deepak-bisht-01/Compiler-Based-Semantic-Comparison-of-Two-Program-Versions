@@ -8,7 +8,7 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "../frontend")));
 
 function resolveCompareExecutable() {
@@ -17,6 +17,20 @@ function resolveCompareExecutable() {
   }
   // Default build output path for Windows with Ninja.
   return path.resolve(__dirname, "../build/compare.exe");
+}
+
+function resolveClangXXExecutable() {
+  if (process.env.CLANGXX) return process.env.CLANGXX;
+
+  // Common default for Windows LLVM installer.
+  const defaultPath = "C:\\Program Files\\LLVM\\bin\\clang++.exe";
+  try {
+    require("fs").accessSync(defaultPath);
+    return defaultPath;
+  } catch {
+    // fall back to PATH
+    return "clang++";
+  }
 }
 
 async function writeTempCodeFile(code, suffix) {
@@ -116,6 +130,131 @@ function extractTopLevelBlock(code) {
     .replace(/^\s*using\s+namespace\s+[^;]+;/gm, " ") // ignore using namespace
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function runClangAstDumpJson(clangxx, cppPath) {
+  const result = spawnSync(
+    clangxx,
+    ["-std=c++17", "-Xclang", "-ast-dump=json", "-fsyntax-only", "-fno-color-diagnostics", cppPath],
+    {
+      encoding: "utf8",
+      maxBuffer: 50 * 1024 * 1024
+    }
+  );
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const msg = (result.stderr || "").trim() || `clang++ exited with code ${result.status}`;
+    throw new Error(msg);
+  }
+
+  const raw = (result.stdout || "").trim();
+  if (!raw) throw new Error("clang++ produced empty AST output.");
+  return JSON.parse(raw);
+}
+
+function getAstChildren(node) {
+  if (!node || typeof node !== "object") return [];
+  if (Array.isArray(node.inner)) return node.inner.filter((x) => x && typeof x === "object");
+  return [];
+}
+
+function nodeLoc(node) {
+  const loc = node.loc || node.range?.begin || node.range?.end || null;
+  if (!loc || typeof loc !== "object") return null;
+  return {
+    file: loc.file || "",
+    line: typeof loc.line === "number" ? loc.line : null,
+    col: typeof loc.col === "number" ? loc.col : null
+  };
+}
+
+function nodeName(node) {
+  if (!node || typeof node !== "object") return "";
+  return (
+    node.name ||
+    node.mangledName ||
+    node.qualifiedName ||
+    node.value ||
+    node.opcode ||
+    node.tagUsed ||
+    ""
+  );
+}
+
+function nodeKey(node) {
+  const kind = node?.kind || "Unknown";
+  const name = nodeName(node);
+  const loc = nodeLoc(node);
+  const locPart = loc ? `${loc.file}:${loc.line ?? ""}:${loc.col ?? ""}` : "";
+  return `${kind}|${name}|${locPart}`;
+}
+
+function nodeSignature(node) {
+  const loc = nodeLoc(node);
+  return JSON.stringify({
+    kind: node?.kind || null,
+    name: nodeName(node) || null,
+    type: node?.type?.qualType || node?.type || null,
+    loc
+  });
+}
+
+function indexAst(root) {
+  const index = new Map(); // key -> signature
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") continue;
+    const key = nodeKey(node);
+    if (!index.has(key)) index.set(key, nodeSignature(node));
+    const kids = getAstChildren(node);
+    for (let i = kids.length - 1; i >= 0; i -= 1) stack.push(kids[i]);
+  }
+  return index;
+}
+
+function annotateAstWithDiff(root, diffMap) {
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") continue;
+    const key = nodeKey(node);
+    const diff = diffMap.get(key);
+    if (diff) node.__diff = diff;
+    const kids = getAstChildren(node);
+    for (let i = kids.length - 1; i >= 0; i -= 1) stack.push(kids[i]);
+  }
+}
+
+function diffAsts(leftAst, rightAst) {
+  const leftIdx = indexAst(leftAst);
+  const rightIdx = indexAst(rightAst);
+
+  const removed = [];
+  const added = [];
+  const modified = [];
+
+  for (const [k, sig] of leftIdx.entries()) {
+    if (!rightIdx.has(k)) removed.push(k);
+    else if (rightIdx.get(k) !== sig) modified.push(k);
+  }
+  for (const k of rightIdx.keys()) {
+    if (!leftIdx.has(k)) added.push(k);
+  }
+
+  const leftDiff = new Map();
+  for (const k of removed) leftDiff.set(k, "removed");
+  for (const k of modified) leftDiff.set(k, "modified");
+
+  const rightDiff = new Map();
+  for (const k of added) rightDiff.set(k, "added");
+  for (const k of modified) rightDiff.set(k, "modified");
+
+  annotateAstWithDiff(leftAst, leftDiff);
+  annotateAstWithDiff(rightAst, rightDiff);
+
+  return { added, removed, modified };
 }
 
 function summarizeTopLevelSemantics(code) {
@@ -632,6 +771,78 @@ app.get("/compare", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: err.message || "Comparison failed."
+    });
+  } finally {
+    await Promise.all(
+      tempFiles.map(async (file) => {
+        try {
+          await fs.unlink(file);
+        } catch {
+          // Best effort cleanup.
+        }
+      })
+    );
+  }
+});
+
+app.post("/ast", async (req, res) => {
+  const { leftPath, rightPath, leftCode, rightCode } = req.body || {};
+
+  let localLeft = leftPath;
+  let localRight = rightPath;
+  const tempFiles = [];
+
+  try {
+    if (!localLeft || !localRight) {
+      if (!leftCode || !rightCode) {
+        return res.status(400).json({
+          ok: false,
+          error: "Provide either leftPath/rightPath or leftCode/rightCode."
+        });
+      }
+      localLeft = await writeTempCodeFile(leftCode, "left");
+      localRight = await writeTempCodeFile(rightCode, "right");
+      tempFiles.push(localLeft, localRight);
+    }
+
+    // Semantic comparison via existing compare.exe workflow.
+    const compareExe = resolveCompareExecutable();
+    let comparison;
+    try {
+      const rawOutput = await runCompare(compareExe, localLeft, localRight);
+      comparison = JSON.parse(rawOutput);
+    } catch (e) {
+      throw new Error(
+        `compare.exe failed. Build core engine and set COMPARE_EXE if needed. Details: ${e.message}`
+      );
+    }
+
+    // AST dumps via clang++ ast-dump=json.
+    const clangxx = resolveClangXXExecutable();
+    let leftAST;
+    let rightAST;
+    try {
+      leftAST = runClangAstDumpJson(clangxx, localLeft);
+      rightAST = runClangAstDumpJson(clangxx, localRight);
+    } catch (e) {
+      throw new Error(
+        `clang++ AST dump failed. Ensure LLVM is installed and set CLANGXX or add LLVM bin to PATH. Details: ${e.message}`
+      );
+    }
+
+    const astDiff = diffAsts(leftAST, rightAST);
+
+    return res.json({
+      ok: true,
+      leftAST,
+      rightAST,
+      comparison,
+      astDiff
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "AST generation failed."
     });
   } finally {
     await Promise.all(

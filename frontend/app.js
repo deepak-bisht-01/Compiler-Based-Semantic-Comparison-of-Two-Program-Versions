@@ -198,8 +198,10 @@ function renderReadable(result) {
 
 function setLoading(isLoading) {
   const button = document.getElementById("compare-btn");
+  const astButton = document.getElementById("ast-btn");
   const loading = document.getElementById("loading");
   button.disabled = isLoading;
+  astButton.disabled = isLoading;
   loading.classList.toggle("hidden", !isLoading);
 }
 
@@ -207,8 +209,14 @@ function setResult(text) {
   document.getElementById("result-panel").textContent = text;
 }
 
+function showAstSection(show) {
+  const section = document.getElementById("ast-section");
+  section.classList.toggle("hidden", !show);
+}
+
 async function compareCode() {
   setLoading(true);
+  showAstSection(false);
   setResult("Running comparison...");
 
   try {
@@ -226,6 +234,37 @@ async function compareCode() {
     }
 
     setResult(renderReadable(data.result));
+  } catch (err) {
+    setResult(`Request failed: ${err.message}`);
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function visualizeAst() {
+  setLoading(true);
+  setResult("Generating ASTs...");
+  showAstSection(false);
+
+  try {
+    const response = await fetch("/ast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        leftCode: leftEditor.getValue(),
+        rightCode: rightEditor.getValue()
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      setResult(`Error: ${data.error || "Unknown backend error."}`);
+      return;
+    }
+
+    showAstSection(true);
+    window.ASTVisualizer.renderSideBySide(data.leftAST, data.rightAST);
+    setResult(renderReadable(data.comparison));
   } catch (err) {
     setResult(`Request failed: ${err.message}`);
   } finally {
@@ -274,4 +313,5 @@ int sum(int a, int b, int c) { return a + b + c; }`,
   });
 
   document.getElementById("compare-btn").addEventListener("click", compareCode);
+  document.getElementById("ast-btn").addEventListener("click", visualizeAst);
 });

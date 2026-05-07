@@ -6,6 +6,7 @@
     <title>Semantic C++ Compare</title>
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.49.0/min/vs/loader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
   </head>
   <body>
     <main class="container">
@@ -27,6 +28,7 @@
 
       <section class="controls">
         <button id="compare-btn">Compare</button>
+        <button id="ast-btn">AST Visualize</button>
         <span id="loading" class="loading hidden">Comparing...</span>
       </section>
 
@@ -34,8 +36,24 @@
         <h2>Output</h2>
         <pre id="result-panel">Run a comparison to see results.</pre>
       </section>
+
+      <section class="ast hidden" id="ast-section">
+        <h2>AST Visualizer</h2>
+        <div class="ast-legend">
+          <span class="legend-item legend-added">Added</span>
+          <span class="legend-item legend-removed">Removed</span>
+          <span class="legend-item legend-modified">Modified</span>
+          <span class="legend-item legend-same">Unchanged</span>
+          <span class="legend-hint">Click nodes to expand/collapse. Scroll to zoom, drag to pan.</span>
+        </div>
+        <div class="ast-grid">
+          <div id="ast-left" class="ast-panel"></div>
+          <div id="ast-right" class="ast-panel"></div>
+        </div>
+      </section>
     </main>
 
+    <script src="astVisualizer.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
